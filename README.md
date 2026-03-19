@@ -1,16 +1,51 @@
-# React + Vite
+# Installation
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+## Frontend
 
-Currently, two official plugins are available:
+### React Frontend
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+1. Install yarn if not available
 
-## React Compiler
+```bash
+ npm install -g yarn
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+2. Install Packages
 
-## Expanding the ESLint configuration
+```bash
+yarn
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+3. Run the front end
+
+```bash
+yarn dev
+```
+
+### Sumo Backend
+
+1. Navigate into the server folder from the root folder
+
+```bash
+cd server
+```
+
+2. Activate venv
+
+- Windows
+
+```powershell
+venv\Scripts\activate
+```
+
+3. Install packages
+
+```bash
+pip install -r requirements.txt
+```
+
+4. Run the sumo backend
+
+```bash
+python app.py
+```
