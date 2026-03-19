@@ -119,6 +119,7 @@ const OpenStreetMapView = ({
       <MapContainer
         center={center}
         zoom={zoom}
+        zoomControl={false}
         scrollWheelZoom={true}
         className="osm-map-container"
       >
