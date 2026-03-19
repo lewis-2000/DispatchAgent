@@ -122,6 +122,7 @@ const OpenStreetMapView = ({
         zoomControl={false}
         scrollWheelZoom={true}
         className="osm-map-container"
+        zooomControl={false}
       >
         <MapClickHandler onMapClick={onMapClick} />
         <TileLayer
