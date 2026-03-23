@@ -1,6 +1,12 @@
 import React, { createContext, useReducer } from "react";
 
 const SimulationContext = createContext();
+let sequence = 0;
+
+const createEventId = (prefix) => {
+  sequence += 1;
+  return `${prefix}-${Date.now()}-${sequence}`;
+};
 
 const initialState = {
   // Vehicle data
@@ -93,7 +99,7 @@ const simulationReducer = (state, action) => {
         ...state,
         alerts: [
           {
-            id: Date.now(),
+            id: createEventId("alert"),
             timestamp: new Date(),
             message: action.payload,
           },
@@ -124,7 +130,7 @@ const simulationReducer = (state, action) => {
         ...state,
         timeline: [
           {
-            id: Date.now(),
+            id: createEventId("timeline"),
             timestamp: new Date(),
             event: action.payload.event,
             vehicleId: action.payload.vehicleId,

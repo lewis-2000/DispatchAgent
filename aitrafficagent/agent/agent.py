@@ -494,7 +494,7 @@ class AITrafficIntelligence:
     """
 
     def __init__(
-        self, api_key: str = "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"
+        self, api_key: str = ""
     ):
         self.name = "Sofia AI"
         self.api_key = api_key

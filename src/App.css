@@ -4,6 +4,10 @@ body {
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
 }
 
+*::-webkit-scrollbar {
+  display: none;
+}
+
 .admin-dashboard {
   position: relative;
   height: 100vh;

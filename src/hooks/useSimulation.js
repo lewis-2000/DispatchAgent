@@ -33,11 +33,16 @@ export const useSimulation = (useMockData = false, options = {}) => {
   const dynamicDisasterZonesRef = useRef([]);
   const pendingDynamicReroutesRef = useRef({});
   const osrmRouteCacheRef = useRef({});
+  const osrmRequestQueueRef = useRef([]);
+  const osrmConcurrentRequestsRef = useRef(0);
+  const MAX_CONCURRENT_OSRM_REQUESTS = 4;
   const nextIncidentSpawnTickRef = useRef(90);
   const nextDisasterSpawnTickRef = useRef(240);
   const dynamicEventCounterRef = useRef(0);
   const rerouteInFlightRef = useRef({});
   const routeTargetRef = useRef({});
+  const vehicleProfileRef = useRef({});
+  const disasterDispatchCursorRef = useRef(0);
   const nextAllowedRerouteTickRef = useRef({});
   const routeLengthRef = useRef({}); // Track total route length per vehicle
   const routeCompletedRef = useRef({}); // Track if route has been completed
@@ -83,10 +88,14 @@ export const useSimulation = (useMockData = false, options = {}) => {
   const DISASTER_SPAWN_MIN_INTERVAL = 360;
   const DISASTER_SPAWN_MAX_INTERVAL = 520;
   const MAX_DYNAMIC_INCIDENTS = 6;
-  const MAX_DYNAMIC_DISASTERS = 3;
+  const MAX_DYNAMIC_DISASTERS = 8;
+  const CLICK_DISASTER_LIFETIME_TICKS = 140;
   const DYNAMIC_EVENT_REROUTE_DELAY_MIN_TICKS = 7;
   const DYNAMIC_EVENT_REROUTE_DELAY_MAX_TICKS = 22;
   const MAX_DYNAMIC_REROUTES_PER_TICK = 2;
+  const GENERATED_CIVILIAN_VEHICLE_COUNT = 24;
+  const CIVILIAN_REROUTE_CHECK_INTERVAL_TICKS = 6;
+  const CIVILIAN_REROUTE_COOLDOWN_TICKS = 10;
 
   const routePointDistanceMeters = useCallback((a, b) => {
     const toRad = (deg) => (deg * Math.PI) / 180;
@@ -216,6 +225,18 @@ export const useSimulation = (useMockData = false, options = {}) => {
     [],
   );
 
+  const processOsrmQueue = useCallback(() => {
+    while (
+      osrmConcurrentRequestsRef.current < MAX_CONCURRENT_OSRM_REQUESTS &&
+      osrmRequestQueueRef.current.length > 0
+    ) {
+      const queueItem = osrmRequestQueueRef.current.shift();
+      if (queueItem) {
+        queueItem();
+      }
+    }
+  }, []);
+
   const fetchRoadSnappedRoute = useCallback(
     async (route) => {
       const normalizedPoints = normalizeRoutePoints(route.points);
@@ -238,65 +259,95 @@ export const useSimulation = (useMockData = false, options = {}) => {
         .map((point) => `${point[1]},${point[0]}`)
         .join(";");
 
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          const response = await fetch(
-            `https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false&alternatives=false`,
-          );
+      // Queue this request to avoid hammering the OSRM API
+      return new Promise((resolve) => {
+        const queueItem = async () => {
+          osrmConcurrentRequestsRef.current += 1;
 
-          if (!response.ok) {
-            if (
-              (response.status === 429 || response.status >= 500) &&
-              attempt < 1
-            ) {
-              await new Promise((resolve) =>
-                setTimeout(resolve, 140 * (attempt + 1)),
-              );
-              continue;
+          try {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 8000);
+
+                const response = await fetch(
+                  `https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false&alternatives=false`,
+                  { signal: controller.signal },
+                );
+
+                clearTimeout(timeout);
+
+                if (!response.ok) {
+                  if (
+                    (response.status === 429 || response.status >= 500) &&
+                    attempt < 2
+                  ) {
+                    const backoffMs =
+                      Math.pow(2, attempt) * 500 + Math.random() * 200;
+                    await new Promise((r) => setTimeout(r, backoffMs));
+                    continue;
+                  }
+                  break;
+                }
+
+                const payload = await response.json();
+                const bestRoute = payload?.routes?.[0];
+                const geometry = bestRoute?.geometry?.coordinates;
+
+                if (!geometry || geometry.length < 2) {
+                  if (attempt < 2) {
+                    await new Promise((r) => setTimeout(r, 200));
+                    continue;
+                  }
+                  break;
+                }
+
+                const mappedGeometry = geometry.map((coord) => [
+                  coord[1],
+                  coord[0],
+                ]);
+                const routed = {
+                  points: mappedGeometry,
+                  legs: [],
+                  distanceMeters: bestRoute?.distance || 0,
+                  durationSeconds: bestRoute?.duration || 0,
+                };
+                osrmRouteCacheRef.current[cacheKey] = routed;
+
+                resolve({
+                  ...route,
+                  ...routed,
+                });
+                return;
+              } catch {
+                if (attempt < 2) {
+                  await new Promise((r) => setTimeout(r, 200));
+                  continue;
+                }
+                break;
+              }
             }
-            break;
+
+            resolve({
+              ...route,
+              points: fallbackPoints,
+            });
+          } finally {
+            osrmConcurrentRequestsRef.current -= 1;
+            processOsrmQueue();
           }
+        };
 
-          const payload = await response.json();
-          const bestRoute = payload?.routes?.[0];
-          const geometry = bestRoute?.geometry?.coordinates;
-
-          if (!geometry || geometry.length < 2) {
-            if (attempt < 1) {
-              await new Promise((resolve) => setTimeout(resolve, 120));
-              continue;
-            }
-            break;
-          }
-
-          const mappedGeometry = geometry.map((coord) => [coord[1], coord[0]]);
-          const routed = {
-            points: mappedGeometry,
-            legs: [],
-            distanceMeters: bestRoute?.distance || 0,
-            durationSeconds: bestRoute?.duration || 0,
-          };
-          osrmRouteCacheRef.current[cacheKey] = routed;
-
-          return {
-            ...route,
-            ...routed,
-          };
-        } catch {
-          if (attempt < 1) {
-            await new Promise((resolve) => setTimeout(resolve, 120));
-            continue;
-          }
-          break;
-        }
-      }
-
-      return {
-        ...route,
-        points: fallbackPoints,
-      };
+        osrmRequestQueueRef.current.push(queueItem);
+        processOsrmQueue();
+      });
     },
-    [buildRouteCacheKey, buildStreetLikeFallbackRoute, normalizeRoutePoints],
+    [
+      buildRouteCacheKey,
+      buildStreetLikeFallbackRoute,
+      normalizeRoutePoints,
+      processOsrmQueue,
+    ],
   );
 
   const minDistanceToIncidents = useCallback(
@@ -500,6 +551,39 @@ export const useSimulation = (useMockData = false, options = {}) => {
     [routePointDistanceMeters],
   );
 
+  const buildDisasterAvoidanceWaypoints = useCallback(
+    (startPos, endPos, disasterZone) => {
+      if (!disasterZone) {
+        return [];
+      }
+
+      const dy = endPos[0] - startPos[0];
+      const dx = endPos[1] - startPos[1];
+      const length = Math.hypot(dx, dy) || 1;
+      const normalLat = -dx / length;
+      const normalLng = dy / length;
+
+      const offsetMeters = Math.max(260, (disasterZone.radius || 0) + 220);
+      const offsetDegrees = offsetMeters / 111000;
+
+      const waypointA = [
+        disasterZone.lat + normalLat * offsetDegrees,
+        disasterZone.lng + normalLng * offsetDegrees,
+      ];
+      const waypointB = [
+        disasterZone.lat - normalLat * offsetDegrees,
+        disasterZone.lng - normalLng * offsetDegrees,
+      ];
+
+      const startDistA = routePointDistanceMeters(startPos, waypointA);
+      const startDistB = routePointDistanceMeters(startPos, waypointB);
+      return startDistA < startDistB
+        ? [waypointA, waypointB]
+        : [waypointB, waypointA];
+    },
+    [routePointDistanceMeters],
+  );
+
   // Get the next dispatch target in round-robin fashion
   const getNextDispatchTarget = useCallback(() => {
     const target =
@@ -672,6 +756,47 @@ export const useSimulation = (useMockData = false, options = {}) => {
     ],
   );
 
+  const getNearestDisasterZoneTarget = useCallback(
+    (originPoint, disasterZones) => {
+      if (!originPoint || !disasterZones?.length) {
+        return null;
+      }
+
+      let nearest = null;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      for (const zone of disasterZones) {
+        const distance = routePointDistanceMeters(
+          [originPoint.lat, originPoint.lng],
+          [zone.lat, zone.lng],
+        );
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearest = zone;
+        }
+      }
+
+      return nearest
+        ? {
+            lat: nearest.lat,
+            lng: nearest.lng,
+            zone: nearest,
+          }
+        : null;
+    },
+    [routePointDistanceMeters],
+  );
+
+  const getVehicleSpeedMetersPerSecond = useCallback(
+    (vehicleId, time, seed) => {
+      const profile = vehicleProfileRef.current[vehicleId];
+      const role = profile?.role || "dispatch";
+      const base = 14 + ((time + seed * 7) % 9);
+      const multiplier = role === "civilian" ? 1.25 : 1.4;
+      return Number((base * multiplier).toFixed(2));
+    },
+    [],
+  );
+
   const getRandomTickInterval = useCallback((min, max) => {
     const span = Math.max(0, max - min);
     return min + Math.floor(Math.random() * (span + 1));
@@ -841,7 +966,13 @@ export const useSimulation = (useMockData = false, options = {}) => {
   );
 
   const requestMockRerouteToLocation = useCallback(
-    async (vehicleId, target, reason = "Manual reroute", tickNow = 0) => {
+    async (
+      vehicleId,
+      target,
+      reason = "Manual reroute",
+      tickNow = 0,
+      options = {},
+    ) => {
       if (
         !target ||
         typeof target.lat !== "number" ||
@@ -862,20 +993,23 @@ export const useSimulation = (useMockData = false, options = {}) => {
         return false;
       }
 
+      const forceTargetUpdate = Boolean(options.forceTargetUpdate);
       const currentTarget = routeTargetRef.current[vehicleId];
       if (currentTarget) {
         const delta = routePointDistanceMeters(
           [currentTarget.lat, currentTarget.lng],
           [target.lat, target.lng],
         );
-        if (delta < MIN_TARGET_CHANGE_DISTANCE_METERS) {
+        if (!forceTargetUpdate && delta < MIN_TARGET_CHANGE_DISTANCE_METERS) {
           return false;
         }
       }
 
       const currentMarker =
         markerStateRef.current[vehicleId] ||
-        mockMapData.markers.find((m) => m.label === `Unit ${vehicleId}`);
+        (baseMarkersRef.current || []).find(
+          (marker) => marker.label === `Unit ${vehicleId}`,
+        );
 
       if (!currentMarker) {
         return false;
@@ -904,41 +1038,71 @@ export const useSimulation = (useMockData = false, options = {}) => {
             (incident.expiresAtTick || Number.POSITIVE_INFINITY) > tickNow,
         );
 
-        const intersectingDisaster = routeIntersectsDisasterZone(
-          rerouted.points,
-          activeDisasterZones,
-        );
-        if (intersectingDisaster) {
-          const disasterSafeRoute = await calculateDisasterAvoidanceRoute(
-            vehicleId,
-            startPos,
-            endPos,
-            activeDisasterZones,
-            intersectingDisaster,
-          );
-          if (disasterSafeRoute?.points?.length > 1) {
-            rerouted = disasterSafeRoute;
-          }
-        }
+        const vehicleProfile = vehicleProfileRef.current[vehicleId] || {};
+        const isCivilian = vehicleProfile.role === "civilian";
 
-        const intersectingIncident = routeIntersectsIncidentZone(
-          rerouted.points,
-          activeIncidents,
-          INCIDENT_ROUTE_BUFFER_METERS,
-        );
-        if (intersectingIncident) {
-          const incidentWaypoints = buildIncidentAvoidanceWaypoints(
-            startPos,
-            endPos,
-            intersectingIncident,
+        if (isCivilian) {
+          const intersectingDisaster = routeIntersectsDisasterZone(
+            rerouted.points,
+            activeDisasterZones,
           );
-          const incidentSafeRoute = await fetchRoadSnappedRoute({
-            ...currentRoute,
-            id: `${currentRoute.id}-inc-${tickNow}`,
-            points: [startPos, ...incidentWaypoints, endPos],
-          });
-          if (incidentSafeRoute?.points?.length > 1) {
-            rerouted = incidentSafeRoute;
+          if (intersectingDisaster) {
+            const disasterSafeRoute = await calculateDisasterAvoidanceRoute(
+              vehicleId,
+              startPos,
+              endPos,
+              activeDisasterZones,
+              intersectingDisaster,
+            );
+            if (disasterSafeRoute?.points?.length > 1) {
+              rerouted = disasterSafeRoute;
+            }
+
+            const stillIntersectingDisaster = routeIntersectsDisasterZone(
+              rerouted.points,
+              [intersectingDisaster],
+            );
+
+            if (stillIntersectingDisaster) {
+              const disasterWaypoints = buildDisasterAvoidanceWaypoints(
+                startPos,
+                endPos,
+                intersectingDisaster,
+              );
+              if (disasterWaypoints.length > 0) {
+                const strongerDisasterBypassRoute = await fetchRoadSnappedRoute(
+                  {
+                    ...currentRoute,
+                    id: `${currentRoute.id}-dz-${tickNow}`,
+                    points: [startPos, ...disasterWaypoints, endPos],
+                  },
+                );
+                if (strongerDisasterBypassRoute?.points?.length > 1) {
+                  rerouted = strongerDisasterBypassRoute;
+                }
+              }
+            }
+          }
+
+          const intersectingIncident = routeIntersectsIncidentZone(
+            rerouted.points,
+            activeIncidents,
+            INCIDENT_ROUTE_BUFFER_METERS,
+          );
+          if (intersectingIncident) {
+            const incidentWaypoints = buildIncidentAvoidanceWaypoints(
+              startPos,
+              endPos,
+              intersectingIncident,
+            );
+            const incidentSafeRoute = await fetchRoadSnappedRoute({
+              ...currentRoute,
+              id: `${currentRoute.id}-inc-${tickNow}`,
+              points: [startPos, ...incidentWaypoints, endPos],
+            });
+            if (incidentSafeRoute?.points?.length > 1) {
+              rerouted = incidentSafeRoute;
+            }
           }
         }
 
@@ -971,7 +1135,10 @@ export const useSimulation = (useMockData = false, options = {}) => {
         routeTargetRef.current[vehicleId] = target;
         mockProgressRef.current[vehicleId] = 0;
         nextAllowedRerouteTickRef.current[vehicleId] =
-          tickNow + REROUTE_COOLDOWN_TICKS;
+          tickNow +
+          (isCivilian
+            ? CIVILIAN_REROUTE_COOLDOWN_TICKS
+            : REROUTE_COOLDOWN_TICKS);
         routeCompletedRef.current[vehicleId] = false; // Reset completion flag for new route
         routeLengthRef.current[vehicleId] = 0; // Reset route length to recalculate
 
@@ -996,9 +1163,11 @@ export const useSimulation = (useMockData = false, options = {}) => {
       }
     },
     [
+      CIVILIAN_REROUTE_COOLDOWN_TICKS,
       INCIDENT_ROUTE_BUFFER_METERS,
       REROUTE_COOLDOWN_TICKS,
       buildIncidentAvoidanceWaypoints,
+      buildDisasterAvoidanceWaypoints,
       calculateDisasterAvoidanceRoute,
       dispatch,
       fetchRoadSnappedRoute,
@@ -1009,19 +1178,21 @@ export const useSimulation = (useMockData = false, options = {}) => {
   );
 
   const queueDynamicReroute = useCallback(
-    (vehicleId, target, reason, tickNow) => {
+    (vehicleId, target, reason, tickNow, options = {}) => {
       if (!vehicleId || !target) {
         return;
       }
 
-      const delay =
-        DYNAMIC_EVENT_REROUTE_DELAY_MIN_TICKS +
-        Math.floor(
-          Math.random() *
-            (DYNAMIC_EVENT_REROUTE_DELAY_MAX_TICKS -
-              DYNAMIC_EVENT_REROUTE_DELAY_MIN_TICKS +
-              1),
-        );
+      const immediate = Boolean(options.immediate);
+      const delay = immediate
+        ? 0
+        : DYNAMIC_EVENT_REROUTE_DELAY_MIN_TICKS +
+          Math.floor(
+            Math.random() *
+              (DYNAMIC_EVENT_REROUTE_DELAY_MAX_TICKS -
+                DYNAMIC_EVENT_REROUTE_DELAY_MIN_TICKS +
+                1),
+          );
 
       pendingDynamicReroutesRef.current[vehicleId] = {
         vehicleId,
@@ -1029,6 +1200,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
         reason,
         executeAtTick: tickNow + delay,
         attempts: 0,
+        forceTargetUpdate: Boolean(options.forceTargetUpdate),
       };
     },
     [
@@ -1050,6 +1222,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
           item.target,
           item.reason,
           tickNow,
+          { forceTargetUpdate: Boolean(item.forceTargetUpdate) },
         );
 
         if (success) {
@@ -1076,7 +1249,29 @@ export const useSimulation = (useMockData = false, options = {}) => {
   // Handle route completion - auto-assign next destination
   const handleRouteCompletion = useCallback(
     (vehicleId) => {
-      const nextTarget = getNextDispatchTarget();
+      const profile = vehicleProfileRef.current[vehicleId] || {};
+      const isCivilian = profile.role === "civilian";
+      const activeDisasterZones = dynamicDisasterZonesRef.current.filter(
+        (zone) =>
+          (zone.expiresAtTick || Number.POSITIVE_INFINITY) >
+          mockDataTickRef.current,
+      );
+      const currentMarker = markerStateRef.current[vehicleId];
+      const origin = {
+        lat: currentMarker?.lat ?? dispatchTargetsRef.current[0].lat,
+        lng: currentMarker?.lng ?? dispatchTargetsRef.current[0].lng,
+      };
+      const disasterTarget = getNearestDisasterZoneTarget(
+        origin,
+        activeDisasterZones,
+      );
+      const nextTarget = isCivilian
+        ? getSafeHazardAwareTarget(
+            origin,
+            activeDisasterZones,
+            dynamicIncidentsRef.current,
+          )
+        : disasterTarget || getNextDispatchTarget();
       const alreadyCompleted = routeCompletedRef.current[vehicleId];
 
       if (!alreadyCompleted) {
@@ -1098,15 +1293,22 @@ export const useSimulation = (useMockData = false, options = {}) => {
         });
       }
 
-      // Auto-reroute to next dispatch target
       requestMockRerouteToLocation(
         vehicleId,
         nextTarget,
-        "Auto-dispatch to next destination",
+        isCivilian
+          ? "Civilian circulation reroute"
+          : "Auto-dispatch to next destination",
         mockDataTickRef.current,
       );
     },
-    [getNextDispatchTarget, dispatch, requestMockRerouteToLocation],
+    [
+      getNearestDisasterZoneTarget,
+      getNextDispatchTarget,
+      getSafeHazardAwareTarget,
+      dispatch,
+      requestMockRerouteToLocation,
+    ],
   );
 
   // Start mock data simulation (animates vehicles)
@@ -1209,6 +1411,12 @@ export const useSimulation = (useMockData = false, options = {}) => {
               newIncident,
             ]);
             if (distance < INCIDENT_AVOID_DISTANCE_METERS) {
+              const profile = vehicleProfileRef.current[vehicleId] || {};
+              const isCivilian = profile.role === "civilian";
+              if (!isCivilian) {
+                continue;
+              }
+
               const currentMarker = markerStateRef.current[vehicleId];
               const target = getSafeHazardAwareTarget(
                 {
@@ -1221,8 +1429,9 @@ export const useSimulation = (useMockData = false, options = {}) => {
               queueDynamicReroute(
                 vehicleId,
                 target,
-                "Emergency incident detour",
+                "Civilian incident avoidance",
                 time,
+                { immediate: true },
               );
             }
           }
@@ -1267,21 +1476,35 @@ export const useSimulation = (useMockData = false, options = {}) => {
               continue;
             }
             if (routeIntersectsDisasterZone(route.points, [newZone])) {
-              const currentMarker = markerStateRef.current[vehicleId];
-              const target = getSafeHazardAwareTarget(
-                {
-                  lat: currentMarker?.lat ?? newZone.lat,
-                  lng: currentMarker?.lng ?? newZone.lng,
-                },
-                disasterZones,
-                incidentList,
-              );
-              queueDynamicReroute(
-                vehicleId,
-                target,
-                `Avoid ${newZone.title}`,
-                time,
-              );
+              const profile = vehicleProfileRef.current[vehicleId] || {};
+              const isCivilian = profile.role === "civilian";
+
+              if (isCivilian) {
+                const currentMarker = markerStateRef.current[vehicleId];
+                const target = getSafeHazardAwareTarget(
+                  {
+                    lat: currentMarker?.lat ?? newZone.lat,
+                    lng: currentMarker?.lng ?? newZone.lng,
+                  },
+                  disasterZones,
+                  incidentList,
+                );
+                queueDynamicReroute(
+                  vehicleId,
+                  target,
+                  `Avoid ${newZone.title}`,
+                  time,
+                  { immediate: true },
+                );
+              } else {
+                queueDynamicReroute(
+                  vehicleId,
+                  { lat: newZone.lat, lng: newZone.lng },
+                  `Emergency response to ${newZone.title}`,
+                  time,
+                  { immediate: true },
+                );
+              }
             }
           }
         }
@@ -1293,126 +1516,156 @@ export const useSimulation = (useMockData = false, options = {}) => {
       void flushDueDynamicReroutes(time);
 
       // Animate vehicles along route geometry where available.
-      const updatedMarkers = baseMarkers.map((marker, markerIndex) => {
-        const unitId = marker.label.replace("Unit ", "");
-        const route = routeByVehicleId.get(unitId);
-        const speedMetersPerSecond = 8 + ((time + markerIndex * 7) % 6);
-        const speedMetersPerTick = speedMetersPerSecond / 10;
-        const previousState = markerStateRef.current[unitId] || {
-          lat: marker.lat,
-          lng: marker.lng,
-        };
-
-        if (route && route.points.length > 1) {
-          const previousProgress = mockProgressRef.current[unitId] || 0;
-          const nextProgress = previousProgress + speedMetersPerTick;
-          mockProgressRef.current[unitId] = nextProgress;
-
-          const nextPoint = getPointAtDistance(route.points, nextProgress);
-
-          // Store route total length for completion detection
-          if (!routeLengthRef.current[unitId]) {
-            routeLengthRef.current[unitId] = nextPoint.totalLength;
+      const updatedMarkers = baseMarkers
+        .filter((m) => m && m.label)
+        .map((marker, markerIndex) => {
+          const unitId = marker.label?.replace("Unit ", "") || "";
+          if (!unitId) {
+            return marker; // Return unchanged if we can't parse the label
           }
+          const route = routeByVehicleId.get(unitId);
+          const profile = vehicleProfileRef.current[unitId] || {};
+          const isCivilian = profile.role === "civilian";
+          const speedMetersPerSecond = getVehicleSpeedMetersPerSecond(
+            unitId,
+            time,
+            markerIndex,
+          );
+          const speedMetersPerTick = speedMetersPerSecond / 10;
+          const previousState = markerStateRef.current[unitId] || {
+            lat: marker.lat,
+            lng: marker.lng,
+          };
 
-          // Detect route completion (vehicle reached destination)
-          const routeLength = routeLengthRef.current[unitId];
-          if (
-            nextProgress >= routeLength &&
-            routeLength > 0 &&
-            !routeCompletedRef.current[unitId]
-          ) {
-            handleRouteCompletion(unitId);
-          }
+          if (route && route.points.length > 1) {
+            const previousProgress = mockProgressRef.current[unitId] || 0;
+            const nextProgress = previousProgress + speedMetersPerTick;
+            mockProgressRef.current[unitId] = nextProgress;
 
-          // Slower reroute cycle: maintain route continuity and only reroute to explicit target coordinates.
-          const nextAllowed = nextAllowedRerouteTickRef.current[unitId] || 0;
-          if (
-            time % REROUTE_CHECK_INTERVAL_TICKS === 0 &&
-            time >= nextAllowed
-          ) {
-            const minIncidentDistance = minDistanceToIncidents(
-              route.points,
-              incidentList,
-            );
-            const intersectingDisaster = routeIntersectsDisasterZone(
-              route.points,
-              disasterZones,
-            );
-            const intersectingIncident = routeIntersectsIncidentZone(
-              route.points,
-              incidentList,
-              INCIDENT_TARGET_BUFFER_METERS,
-            );
-            const nearIncident =
-              minIncidentDistance < INCIDENT_AVOID_DISTANCE_METERS;
-            const forcedHazardReroute =
-              Boolean(intersectingDisaster) || Boolean(intersectingIncident);
-            const shouldReroute =
-              forcedHazardReroute ||
-              Math.random() <
-                (nearIncident
-                  ? INCIDENT_REROUTE_PROBABILITY
-                  : NORMAL_REROUTE_PROBABILITY);
+            const nextPoint = getPointAtDistance(route.points, nextProgress);
 
-            if (shouldReroute) {
-              const target = getSafeHazardAwareTarget(
-                {
-                  lat: previousState.lat,
-                  lng: previousState.lng,
-                },
-                disasterZones,
+            // Store route total length for completion detection
+            if (!routeLengthRef.current[unitId]) {
+              routeLengthRef.current[unitId] = nextPoint.totalLength;
+            }
+
+            // Detect route completion (vehicle reached destination)
+            const routeLength = routeLengthRef.current[unitId];
+            if (
+              nextProgress >= routeLength &&
+              routeLength > 0 &&
+              !routeCompletedRef.current[unitId]
+            ) {
+              handleRouteCompletion(unitId);
+            }
+
+            // Slower reroute cycle: maintain route continuity and only reroute to explicit target coordinates.
+            const nextAllowed = nextAllowedRerouteTickRef.current[unitId] || 0;
+            const rerouteInterval = isCivilian
+              ? CIVILIAN_REROUTE_CHECK_INTERVAL_TICKS
+              : REROUTE_CHECK_INTERVAL_TICKS;
+            if (time % rerouteInterval === 0 && time >= nextAllowed) {
+              const minIncidentDistance = minDistanceToIncidents(
+                route.points,
                 incidentList,
               );
-
-              queueDynamicReroute(
-                unitId,
-                target,
-                forcedHazardReroute
-                  ? "Forced hazard avoidance"
-                  : nearIncident
-                    ? "Hazard Avoidance Detour"
-                    : "Dynamic Reroute",
-                time,
+              const intersectingDisaster = routeIntersectsDisasterZone(
+                route.points,
+                disasterZones,
               );
+              const intersectingIncident = routeIntersectsIncidentZone(
+                route.points,
+                incidentList,
+                INCIDENT_TARGET_BUFFER_METERS,
+              );
+              const nearIncident =
+                minIncidentDistance < INCIDENT_AVOID_DISTANCE_METERS;
+              const forcedHazardReroute =
+                Boolean(intersectingDisaster) || Boolean(intersectingIncident);
+              const shouldReroute =
+                forcedHazardReroute ||
+                Math.random() <
+                  (nearIncident
+                    ? INCIDENT_REROUTE_PROBABILITY
+                    : NORMAL_REROUTE_PROBABILITY);
+
+              if (shouldReroute) {
+                const origin = {
+                  lat: previousState.lat,
+                  lng: previousState.lng,
+                };
+                const target = isCivilian
+                  ? getSafeHazardAwareTarget(
+                      origin,
+                      disasterZones,
+                      incidentList,
+                    )
+                  : getNearestDisasterZoneTarget(origin, disasterZones) ||
+                    getSafeHazardAwareTarget(
+                      origin,
+                      disasterZones,
+                      incidentList,
+                    );
+
+                queueDynamicReroute(
+                  unitId,
+                  target,
+                  isCivilian
+                    ? forcedHazardReroute
+                      ? "Immediate hazard avoidance"
+                      : nearIncident
+                        ? "Civilian incident detour"
+                        : "Civilian dynamic reroute"
+                    : disasterZones.length > 0
+                      ? "Emergency disaster response"
+                      : forcedHazardReroute
+                        ? "Forced hazard avoidance"
+                        : "Dynamic Reroute",
+                  time,
+                  {
+                    immediate: isCivilian && forcedHazardReroute,
+                  },
+                );
+              }
             }
+
+            const eased = {
+              lat:
+                previousState.lat + (nextPoint.lat - previousState.lat) * 0.28,
+              lng:
+                previousState.lng + (nextPoint.lng - previousState.lng) * 0.28,
+            };
+            markerStateRef.current[unitId] = eased;
+
+            return {
+              ...marker,
+              lat: eased.lat,
+              lng: eased.lng,
+            };
           }
 
-          const eased = {
-            lat: previousState.lat + (nextPoint.lat - previousState.lat) * 0.28,
-            lng: previousState.lng + (nextPoint.lng - previousState.lng) * 0.28,
+          // Units without routes orbit around their base point so they still move.
+          const phase = time / 18 + markerIndex;
+          const nextIdlePosition = {
+            lat: marker.lat + Math.sin(phase) * 0.0014,
+            lng: marker.lng + Math.cos(phase) * 0.0014,
           };
-          markerStateRef.current[unitId] = eased;
+          const easedIdle = {
+            lat:
+              previousState.lat +
+              (nextIdlePosition.lat - previousState.lat) * 0.2,
+            lng:
+              previousState.lng +
+              (nextIdlePosition.lng - previousState.lng) * 0.2,
+          };
+          markerStateRef.current[unitId] = easedIdle;
 
           return {
             ...marker,
-            lat: eased.lat,
-            lng: eased.lng,
+            lat: easedIdle.lat,
+            lng: easedIdle.lng,
           };
-        }
-
-        // Units without routes orbit around their base point so they still move.
-        const phase = time / 18 + markerIndex;
-        const nextIdlePosition = {
-          lat: marker.lat + Math.sin(phase) * 0.0014,
-          lng: marker.lng + Math.cos(phase) * 0.0014,
-        };
-        const easedIdle = {
-          lat:
-            previousState.lat +
-            (nextIdlePosition.lat - previousState.lat) * 0.2,
-          lng:
-            previousState.lng +
-            (nextIdlePosition.lng - previousState.lng) * 0.2,
-        };
-        markerStateRef.current[unitId] = easedIdle;
-
-        return {
-          ...marker,
-          lat: easedIdle.lat,
-          lng: easedIdle.lng,
-        };
-      });
+        });
 
       const markerByUnitId = new Map(
         updatedMarkers.map((marker) => [
@@ -1426,7 +1679,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
         const route = routeByVehicleId.get(vehicle.id);
         const moving = Boolean(route && route.points.length > 1);
         const speedMetersPerSecond = moving
-          ? 8 + ((time + vehicleIndex * 7) % 6)
+          ? getVehicleSpeedMetersPerSecond(vehicle.id, time, vehicleIndex)
           : 0;
 
         return {
@@ -1455,22 +1708,35 @@ export const useSimulation = (useMockData = false, options = {}) => {
           const nextAllowed =
             nextAllowedRerouteTickRef.current[vehicle.id] || 0;
           if (intersectingZone && time >= nextAllowed) {
-            const currentPosition = {
-              lat: vehicle.lat,
-              lng: vehicle.lng,
-            };
-            const target = getSafeHazardAwareTarget(
-              currentPosition,
-              disasterZones,
-              incidentList,
-            );
+            const profile = vehicleProfileRef.current[vehicle.id] || {};
+            const isCivilianVehicle = profile.role === "civilian";
+            if (isCivilianVehicle) {
+              const currentPosition = {
+                lat: vehicle.lat,
+                lng: vehicle.lng,
+              };
+              const target = getSafeHazardAwareTarget(
+                currentPosition,
+                disasterZones,
+                incidentList,
+              );
 
-            queueDynamicReroute(
-              vehicle.id,
-              target,
-              `Disaster Zone Avoidance (${intersectingZone.title})`,
-              time,
-            );
+              queueDynamicReroute(
+                vehicle.id,
+                target,
+                `Disaster Zone Avoidance (${intersectingZone.title})`,
+                time,
+                { immediate: true },
+              );
+            } else {
+              queueDynamicReroute(
+                vehicle.id,
+                { lat: intersectingZone.lat, lng: intersectingZone.lng },
+                `Emergency response to ${intersectingZone.title}`,
+                time,
+                { immediate: true },
+              );
+            }
           }
         }
       }
@@ -1488,6 +1754,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
       });
     }, 100); // 10 Hz update rate (same as backend)
   }, [
+    CIVILIAN_REROUTE_CHECK_INTERVAL_TICKS,
     INCIDENT_AVOID_DISTANCE_METERS,
     INCIDENT_REROUTE_PROBABILITY,
     INCIDENT_TARGET_BUFFER_METERS,
@@ -1503,6 +1770,8 @@ export const useSimulation = (useMockData = false, options = {}) => {
     calculateDisasterZoneHeatmapData,
     handleRouteCompletion,
     getSafeHazardAwareTarget,
+    getNearestDisasterZoneTarget,
+    getVehicleSpeedMetersPerSecond,
     buildIncidentFromRoute,
     buildDisasterZoneFromRoute,
     getRandomTickInterval,
@@ -1520,15 +1789,123 @@ export const useSimulation = (useMockData = false, options = {}) => {
 
       const setupMockRouting = async () => {
         const disasterZones = mockMapData.disasterZones || [];
+        const preexistingDynamicDisasters = (
+          dynamicDisasterZonesRef.current || []
+        ).filter((zone) => zone?.dynamic);
 
-        const seededMarkers = mockMapData.markers.map((marker) => {
-          const spawn = getSafeSpawnPoint(disasterZones);
-          return {
-            ...marker,
-            lat: spawn.lat,
-            lng: spawn.lng,
-            status: "Regular traffic in transit",
+        const generatedCivilianVehicles = Array.from(
+          { length: GENERATED_CIVILIAN_VEHICLE_COUNT },
+          (_, index) => {
+            const civilianAnchors = [
+              ...spawnPointsRef.current,
+              ...farDestinationPointsRef.current,
+              ...dispatchTargetsRef.current,
+            ];
+            const spawn = civilianAnchors[index % civilianAnchors.length];
+            const angle = (index * 47 * Math.PI) / 180;
+            const spreadMeters = 180 + (index % 7) * 45;
+            const latJitter = (Math.sin(angle) * spreadMeters) / 111000;
+            const lngJitter =
+              (Math.cos(angle) * spreadMeters) /
+              (111000 * Math.max(0.35, Math.cos((spawn.lat * Math.PI) / 180)));
+            return {
+              id: `C-${String(index + 1).padStart(3, "0")}`,
+              type: "Civilian",
+              zone: "Public",
+              state: "Commuting",
+              eta: "--",
+              lat: spawn.lat + latJitter,
+              lng: spawn.lng + lngJitter,
+              speed: 0,
+              maxSpeed: 14,
+              heading: (index * 27) % 360,
+              routeEdges: [],
+              hasRoute: true,
+            };
+          },
+        );
+
+        const allVehicles = [...mockVehicles, ...generatedCivilianVehicles];
+        const generatedCivilianMarkers = generatedCivilianVehicles.map(
+          (vehicle, index) => ({
+            id: `cv-${index + 1}`,
+            lat: vehicle.lat,
+            lng: vehicle.lng,
+            label: `Unit ${vehicle.id}`,
+            status: "Civilian traffic",
+            type: "Civilian",
+          }),
+        );
+        const allMarkers = [
+          ...mockMapData.markers,
+          ...generatedCivilianMarkers,
+        ];
+
+        const seededMarkers = [];
+        const MIN_SPAWN_SEPARATION_METERS = 120;
+
+        allMarkers.forEach((marker, index) => {
+          let spawn = {
+            lat: marker.lat,
+            lng: marker.lng,
           };
+
+          const insideDisasterBuffer = disasterZones.some((zone) => {
+            const distance = routePointDistanceMeters(
+              [spawn.lat, spawn.lng],
+              [zone.lat, zone.lng],
+            );
+            return distance <= (zone.radius || 0) + 120;
+          });
+
+          if (insideDisasterBuffer) {
+            spawn = getSafeSpawnPoint(disasterZones);
+          }
+
+          let placed = null;
+
+          for (let attempt = 0; attempt < 18; attempt += 1) {
+            const angleDeg = index * 137.5 + attempt * 29;
+            const angle = (angleDeg * Math.PI) / 180;
+            const radiusMeters = 35 + (index % 8) * 16 + attempt * 22;
+            const latJitter = (Math.sin(angle) * radiusMeters) / 111000;
+            const lngJitter =
+              (Math.cos(angle) * radiusMeters) /
+              (111000 * Math.max(0.35, Math.cos((spawn.lat * Math.PI) / 180)));
+
+            const candidate = {
+              lat: spawn.lat + latJitter,
+              lng: spawn.lng + lngJitter,
+            };
+
+            const tooClose = seededMarkers.some((existing) => {
+              const separation = routePointDistanceMeters(
+                [existing.lat, existing.lng],
+                [candidate.lat, candidate.lng],
+              );
+              return separation < MIN_SPAWN_SEPARATION_METERS;
+            });
+
+            if (!tooClose) {
+              placed = candidate;
+              break;
+            }
+          }
+
+          const fallback = placed || {
+            lat: spawn.lat + ((index % 11) - 5) * 0.0002,
+            lng: spawn.lng + (((index * 3) % 11) - 5) * 0.0002,
+          };
+
+          seededMarkers.push({
+            ...marker,
+            lat: fallback.lat,
+            lng: fallback.lng,
+            status:
+              marker.type === "Civilian"
+                ? "Civilian traffic in transit"
+                : "Dispatch vehicle in transit",
+          });
         });
 
         const markerByVehicle = new Map(
@@ -1538,7 +1915,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
           ]),
         );
 
-        const seededVehicles = mockVehicles.map((vehicle) => {
+        const seededVehicles = allVehicles.map((vehicle) => {
           const marker = markerByVehicle.get(vehicle.id);
           return {
             ...vehicle,
@@ -1550,6 +1927,22 @@ export const useSimulation = (useMockData = false, options = {}) => {
           };
         });
 
+        // Render vehicles immediately while road-snapped routes are still being prepared.
+        baseMarkersRef.current = seededMarkers;
+        seedVehiclesRef.current = seededVehicles;
+        dispatch({ type: "SET_VEHICLES", payload: seededVehicles });
+        dispatch({
+          type: "UPDATE_MAP_DATA",
+          payload: {
+            ...mockMapData,
+            markers: seededMarkers,
+            routes: [],
+            incidents: dynamicIncidentsRef.current,
+            disasterZones: dynamicDisasterZonesRef.current,
+            heatmapData: [],
+          },
+        });
+
         const routeColors = [
           "#22c55e",
           "#3b82f6",
@@ -1559,34 +1952,14 @@ export const useSimulation = (useMockData = false, options = {}) => {
         ];
         const destinationByVehicleId = {};
 
-        const routed = await Promise.all(
-          seededVehicles.map(async (vehicle, index) => {
-            const origin = { lat: vehicle.lat, lng: vehicle.lng };
-            const destination = getSafeFarDestination(origin, disasterZones);
-            destinationByVehicleId[vehicle.id] = destination;
+        vehicleProfileRef.current = {};
+        seededVehicles.forEach((vehicle) => {
+          vehicleProfileRef.current[vehicle.id] = {
+            role: vehicle.type === "Civilian" ? "civilian" : "dispatch",
+          };
+        });
 
-            const route = await calculateDisasterAvoidanceRoute(
-              vehicle.id,
-              [origin.lat, origin.lng],
-              [destination.lat, destination.lng],
-              disasterZones,
-            );
-
-            return {
-              ...route,
-              id: `seed-${vehicle.id}`,
-              vehicleId: vehicle.id,
-              color: routeColors[index % routeColors.length],
-              name: "Regular traffic route",
-            };
-          }),
-        );
-
-        if (cancelled) {
-          return;
-        }
-
-        // Assign default destinations to all vehicles
+        // Initialize runtime refs before routes are fully prepared.
         mockProgressRef.current = {};
         markerStateRef.current = {};
         historicalRoutesRef.current = [];
@@ -1603,7 +1976,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
             dynamic: false,
           }),
         );
-        dynamicDisasterZonesRef.current = (mockMapData.disasterZones || []).map(
+        const baselineDisasterZones = (mockMapData.disasterZones || []).map(
           (zone) => ({
             ...zone,
             createdAtTick: 0,
@@ -1611,13 +1984,95 @@ export const useSimulation = (useMockData = false, options = {}) => {
             dynamic: false,
           }),
         );
+        const dynamicSnapshotAtInit = (
+          dynamicDisasterZonesRef.current || []
+        ).filter((zone) => zone?.dynamic);
+        const dynamicDisasterMap = new Map(
+          [...preexistingDynamicDisasters, ...dynamicSnapshotAtInit].map(
+            (zone) => [
+              zone.id,
+              {
+                ...zone,
+                createdAtTick: Number.isFinite(Number(zone.createdAtTick))
+                  ? Number(zone.createdAtTick)
+                  : mockDataTickRef.current,
+                expiresAtTick: Number.isFinite(Number(zone.expiresAtTick))
+                  ? Number(zone.expiresAtTick)
+                  : mockDataTickRef.current + DISASTER_LIFETIME_TICKS,
+                dynamic: true,
+              },
+            ],
+          ),
+        );
+        const preservedDynamicDisasters = Array.from(
+          dynamicDisasterMap.values(),
+        );
+        dynamicDisasterZonesRef.current = [
+          ...baselineDisasterZones,
+          ...preservedDynamicDisasters,
+        ];
         nextIncidentSpawnTickRef.current = 90;
         nextDisasterSpawnTickRef.current = 240;
-        dynamicEventCounterRef.current = 0;
-        baseMarkersRef.current = seededMarkers;
-        seedVehiclesRef.current = seededVehicles;
+        dynamicEventCounterRef.current = Math.max(
+          dynamicEventCounterRef.current,
+          preservedDynamicDisasters.length,
+        );
+        disasterDispatchCursorRef.current += 1;
 
-        // Initialize route targets
+        const routed = await Promise.all(
+          seededVehicles.map(async (vehicle, index) => {
+            const origin = { lat: vehicle.lat, lng: vehicle.lng };
+            const profile = vehicleProfileRef.current[vehicle.id] || {};
+            const isCivilian = profile.role === "civilian";
+            const disasterDispatchTarget =
+              disasterZones.length > 0
+                ? disasterZones[
+                    (disasterDispatchCursorRef.current + index) %
+                      disasterZones.length
+                  ]
+                : null;
+            const destination = isCivilian
+              ? getSafeFarDestination(origin, disasterZones)
+              : disasterDispatchTarget
+                ? {
+                    lat: disasterDispatchTarget.lat,
+                    lng: disasterDispatchTarget.lng,
+                  }
+                : getSafeFarDestination(origin, disasterZones);
+            destinationByVehicleId[vehicle.id] = destination;
+
+            const route = isCivilian
+              ? await calculateDisasterAvoidanceRoute(
+                  vehicle.id,
+                  [origin.lat, origin.lng],
+                  [destination.lat, destination.lng],
+                  disasterZones,
+                )
+              : await fetchRoadSnappedRoute({
+                  id: `seed-${vehicle.id}`,
+                  points: [
+                    [origin.lat, origin.lng],
+                    [destination.lat, destination.lng],
+                  ],
+                });
+
+            return {
+              ...route,
+              id: `seed-${vehicle.id}`,
+              vehicleId: vehicle.id,
+              color: routeColors[index % routeColors.length],
+              name: isCivilian
+                ? "Civilian commuter route"
+                : "Emergency dispatch route",
+            };
+          }),
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        // Initialize route targets from computed routes.
         for (const route of routed) {
           if (route?.vehicleId && route.points?.length) {
             const preferredDestination =
@@ -1629,21 +2084,31 @@ export const useSimulation = (useMockData = false, options = {}) => {
               lat: destination[0],
               lng: destination[1],
             };
+            const profile = vehicleProfileRef.current[route.vehicleId] || {};
             nextAllowedRerouteTickRef.current[route.vehicleId] =
-              REROUTE_COOLDOWN_TICKS;
+              profile.role === "civilian" ? 0 : REROUTE_COOLDOWN_TICKS;
           }
         }
 
         // Ensure ALL vehicles have destinations
         for (const vehicle of seededVehicles) {
           if (!routeTargetRef.current[vehicle.id]) {
-            const defaultTarget = getSafeFarDestination(
-              { lat: vehicle.lat, lng: vehicle.lng },
-              disasterZones,
-            );
+            const profile = vehicleProfileRef.current[vehicle.id] || {};
+            const defaultTarget =
+              profile.role === "civilian"
+                ? getSafeFarDestination(
+                    { lat: vehicle.lat, lng: vehicle.lng },
+                    disasterZones,
+                  )
+                : disasterZones[0]
+                  ? { lat: disasterZones[0].lat, lng: disasterZones[0].lng }
+                  : getSafeFarDestination(
+                      { lat: vehicle.lat, lng: vehicle.lng },
+                      disasterZones,
+                    );
             routeTargetRef.current[vehicle.id] = defaultTarget;
             nextAllowedRerouteTickRef.current[vehicle.id] =
-              REROUTE_COOLDOWN_TICKS;
+              profile.role === "civilian" ? 0 : REROUTE_COOLDOWN_TICKS;
           }
         }
 
@@ -1695,6 +2160,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
         routeCompletedRef.current = {};
         routeLengthRef.current = {};
         pendingDynamicReroutesRef.current = {};
+        vehicleProfileRef.current = {};
         dynamicIncidentsRef.current = [];
         dynamicDisasterZonesRef.current = [];
         baseMarkersRef.current = mockMapData.markers;
@@ -1707,20 +2173,22 @@ export const useSimulation = (useMockData = false, options = {}) => {
     routeTargetRef.current = {};
     nextAllowedRerouteTickRef.current = {};
     pendingDynamicReroutesRef.current = {};
+    vehicleProfileRef.current = {};
     dynamicIncidentsRef.current = [];
     dynamicDisasterZonesRef.current = [];
     return undefined;
   }, [
+    GENERATED_CIVILIAN_VEHICLE_COUNT,
     REROUTE_COOLDOWN_TICKS,
     controller,
     useMockData,
     dispatch,
     fetchRoadSnappedRoute,
     startMockDataSimulation,
-    getNextDispatchTarget,
     calculateDisasterAvoidanceRoute,
     getSafeFarDestination,
     getSafeSpawnPoint,
+    routePointDistanceMeters,
   ]);
 
   const buildRouteSignature = useCallback((route) => {
@@ -1954,6 +2422,183 @@ export const useSimulation = (useMockData = false, options = {}) => {
     [dispatch],
   );
 
+  const addDisasterAtLocation = useCallback(
+    (lat, lng, timeNow = 0) => {
+      if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) {
+        return false;
+      }
+
+      const uiTick = Number.isFinite(Number(timeNow)) ? Number(timeNow) : 0;
+      const currentTick = Math.max(
+        uiTick,
+        Number(mockDataTickRef.current || 0),
+      );
+
+      const existingDisasters =
+        dynamicDisasterZonesRef.current.length > 0
+          ? dynamicDisasterZonesRef.current
+          : state.mapData.disasterZones || [];
+      const dynamicDisasterCount = existingDisasters.filter(
+        (zone) => zone?.dynamic,
+      ).length;
+
+      // Check if we've reached max disasters
+      if (dynamicDisasterCount >= MAX_DYNAMIC_DISASTERS) {
+        addAlert("Maximum number of disaster zones reached");
+        return false;
+      }
+
+      dynamicEventCounterRef.current += 1;
+      const id = `click-dz-${Date.now()}-${dynamicEventCounterRef.current}`;
+      const radius = 80;
+
+      // Build detour waypoints around the disaster
+      const offset = radius / 111000;
+      const waypoints = [
+        { lat: lat + offset * 0.9, lng: lng - offset * 0.8 },
+        { lat: lat + offset * 0.8, lng: lng + offset * 0.9 },
+        { lat: lat - offset * 0.85, lng: lng + offset * 0.8 },
+      ];
+
+      const newDisaster = {
+        id,
+        lat: Number(lat),
+        lng: Number(lng),
+        title: "Operator-created disaster zone",
+        detail: "Emergency operations active, forced detours applied",
+        color: "#dc2626",
+        radius,
+        intensity: 0.9,
+        severity: "critical",
+        avoidanceWaypoints: waypoints,
+        createdAtTick: currentTick,
+        expiresAtTick: currentTick + CLICK_DISASTER_LIFETIME_TICKS,
+        dynamic: true,
+      };
+
+      // Add to active disaster zones
+      dynamicDisasterZonesRef.current = [...existingDisasters, newDisaster];
+
+      const effectiveIncidents =
+        dynamicIncidentsRef.current.length > 0
+          ? dynamicIncidentsRef.current
+          : state.mapData.incidents || [];
+      const effectiveRoutes = mockRoutesRef.current?.length
+        ? mockRoutesRef.current
+        : state.mapData.routes || [];
+
+      dispatch({
+        type: "UPDATE_MAP_DATA",
+        payload: {
+          ...state.mapData,
+          incidents: effectiveIncidents,
+          disasterZones: dynamicDisasterZonesRef.current,
+          routes: effectiveRoutes,
+          heatmapData: calculateDisasterZoneHeatmapData(
+            dynamicDisasterZonesRef.current,
+          ),
+          tick: mockDataTickRef.current,
+        },
+      });
+
+      // Trigger immediate reroutes for nearby civilian vehicles
+      const routeByVehicleId = new Map(
+        effectiveRoutes.map((route) => [route.vehicleId, route]),
+      );
+
+      const markerByVehicleId = new Map(
+        (baseMarkersRef.current || []).map((marker) => [
+          marker.label?.replace("Unit ", ""),
+          marker,
+        ]),
+      );
+
+      const civilianCandidates = Object.entries(vehicleProfileRef.current)
+        .filter(([, profile]) => profile?.role === "civilian")
+        .map(([vehicleId]) => {
+          const route = routeByVehicleId.get(vehicleId);
+          const marker =
+            markerStateRef.current[vehicleId] ||
+            markerByVehicleId.get(vehicleId);
+          const origin = {
+            lat: marker?.lat ?? newDisaster.lat,
+            lng: marker?.lng ?? newDisaster.lng,
+          };
+          const markerDistance = routePointDistanceMeters(
+            [origin.lat, origin.lng],
+            [newDisaster.lat, newDisaster.lng],
+          );
+          const routeDistance = route?.points?.length
+            ? minDistanceToDisasterZone(route.points, [newDisaster])
+            : Number.POSITIVE_INFINITY;
+          const intersectsRoute =
+            route?.points?.length > 1
+              ? Boolean(
+                  routeIntersectsDisasterZone(route.points, [newDisaster]),
+                )
+              : false;
+          const shouldReroute =
+            intersectsRoute ||
+            routeDistance < INCIDENT_AVOID_DISTANCE_METERS * 2.2 ||
+            markerDistance < (newDisaster.radius || 0) + 650;
+
+          return {
+            vehicleId,
+            origin,
+            markerDistance,
+            shouldReroute,
+          };
+        })
+        .filter((candidate) => candidate.shouldReroute)
+        .sort((a, b) => a.markerDistance - b.markerDistance)
+        .slice(0, 10);
+
+      for (const candidate of civilianCandidates) {
+        const target = getSafeHazardAwareTarget(
+          candidate.origin,
+          dynamicDisasterZonesRef.current,
+          dynamicIncidentsRef.current,
+        );
+
+        queueDynamicReroute(
+          candidate.vehicleId,
+          target,
+          "Operator-created disaster avoidance",
+          currentTick,
+          { immediate: true, forceTargetUpdate: true },
+        );
+
+        void requestMockRerouteToLocation(
+          candidate.vehicleId,
+          target,
+          "Operator-created disaster avoidance",
+          currentTick,
+          { forceTargetUpdate: true },
+        );
+      }
+
+      addAlert(
+        `Disaster zone created for ~${Math.round(CLICK_DISASTER_LIFETIME_TICKS / 10)}s. Rerouting ${civilianCandidates.length} nearby civilians.`,
+      );
+      return true;
+    },
+    [
+      CLICK_DISASTER_LIFETIME_TICKS,
+      INCIDENT_AVOID_DISTANCE_METERS,
+      addAlert,
+      calculateDisasterZoneHeatmapData,
+      dispatch,
+      minDistanceToDisasterZone,
+      getSafeHazardAwareTarget,
+      MAX_DYNAMIC_DISASTERS,
+      requestMockRerouteToLocation,
+      queueDynamicReroute,
+      routeIntersectsDisasterZone,
+      routePointDistanceMeters,
+      state.mapData,
+    ],
+  );
+
   // Helper: Add timeline event
   const addTimelineEvent = useCallback(
     (event, vehicleId, details) => {
@@ -2029,5 +2674,7 @@ export const useSimulation = (useMockData = false, options = {}) => {
     calculateDisasterZoneHeatmapData,
     calculateDisasterAvoidanceRoute,
     minDistanceToDisasterZone,
+    addDisasterAtLocation,
+    vehicleProfiles: vehicleProfileRef.current,
   };
 };

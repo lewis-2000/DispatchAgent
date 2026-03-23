@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useMemo } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -14,6 +14,11 @@ import "leaflet/dist/leaflet.css";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerIcon from "leaflet/dist/images/marker-icon.png";
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
+import {
+  createVehicleIcon,
+  createDisasterIcon,
+  createIncidentIcon,
+} from "../utils/mapIcons";
 
 // Fixes missing marker icons in Vite/Webpack environments.
 delete L.Icon.Default.prototype._getIconUrl;
@@ -21,17 +26,6 @@ L.Icon.Default.mergeOptions({
   iconRetinaUrl: markerIcon2x,
   iconUrl: markerIcon,
   shadowUrl: markerShadow,
-});
-
-const vehicleIcon = new L.Icon({
-  iconRetinaUrl: markerIcon2x,
-  iconUrl: markerIcon,
-  shadowUrl: markerShadow,
-  iconSize: [25, 41],
-  iconAnchor: [12, 41],
-  popupAnchor: [1, -34],
-  shadowSize: [41, 41],
-  className: "vehicle-marker-smooth",
 });
 
 const MapClickHandler = ({ onMapClick }) => {
@@ -56,9 +50,54 @@ const OpenStreetMapView = ({
   heatmapData = [],
   className = "",
   onMapClick,
+  onMarkerClick,
   mapClickMode = false,
   selectedVehicleLabel,
+  vehicleProfiles = {},
 }) => {
+  // Create icon cache to avoid recreating icons on every render
+  const iconCache = useMemo(() => {
+    const cache = {
+      disasterIcon: createDisasterIcon(),
+      incidentIcon: createIncidentIcon(),
+    };
+
+    // Pre-create common vehicle icons
+    cache.dispatchPatrol = createVehicleIcon("dispatch", "Patrol");
+    cache.dispatchRapid = createVehicleIcon("dispatch", "Rapid");
+    cache.dispatchTow = createVehicleIcon("dispatch", "Tow");
+    cache.dispatchSupport = createVehicleIcon("dispatch", "Support");
+    cache.civilian = createVehicleIcon("civilian", "Civilian");
+
+    return cache;
+  }, []);
+
+  // Helper to get the correct vehicle icon for a marker
+  const getVehicleIcon = (marker) => {
+    const unitId = marker.label?.replace("Unit ", "");
+    const profile = vehicleProfiles[unitId];
+    const role =
+      profile?.role || (marker.type === "Civilian" ? "civilian" : "dispatch");
+    const markerType = marker.type || "Patrol";
+
+    if (role === "civilian") {
+      return iconCache.civilian;
+    }
+
+    // Use specific dispatch vehicle icons
+    switch (markerType) {
+      case "Rapid":
+      case "Ambulance":
+        return iconCache.dispatchRapid;
+      case "Tow":
+        return iconCache.dispatchTow;
+      case "Support":
+        return iconCache.dispatchSupport;
+      default:
+        return iconCache.dispatchPatrol;
+    }
+  };
+
   const getEventAging = (event) => {
     const createdAtTick = Number(event?.createdAtTick);
     const expiresAtTick = Number(event?.expiresAtTick);
@@ -184,12 +223,21 @@ const OpenStreetMapView = ({
 
         {markers.map((marker) => (
           <Marker
-            key={marker.id}
+            key={marker.label}
             position={[marker.lat, marker.lng]}
-            icon={vehicleIcon}
+            icon={getVehicleIcon(marker)}
+            eventHandlers={{
+              click: () => {
+                if (onMarkerClick) {
+                  onMarkerClick(marker);
+                }
+              },
+            }}
           >
             <Popup>
               <strong>{marker.label}</strong>
+              <br />
+              Position: {marker.lat.toFixed(4)}, {marker.lng.toFixed(4)}
               <br />
               {marker.status}
               {selectedVehicleLabel &&
@@ -206,27 +254,18 @@ const OpenStreetMapView = ({
         {incidents.map((incident) =>
           (() => {
             const aging = getEventAging(incident);
-            const radiusScale = 0.78 + aging.ageRatio * 0.42;
-            const fillOpacity = 0.14 + aging.ageRatio * 0.3;
-            const ringWeight = 1.2 + aging.ageRatio * 1.8;
 
             return (
-              <CircleMarker
+              <Marker
                 key={incident.id}
-                center={[incident.lat, incident.lng]}
-                radius={(incident.radius || 10) * radiusScale}
-                pathOptions={{
-                  color: incident.color || "#ef4444",
-                  fillColor: incident.color || "#ef4444",
-                  fillOpacity,
-                  weight: ringWeight,
-                }}
+                position={[incident.lat, incident.lng]}
+                icon={iconCache.incidentIcon}
               >
                 {aging.hasCountdown && (
                   <Tooltip
                     permanent
                     direction="top"
-                    offset={[0, -12]}
+                    offset={[0, -2]}
                     className="event-countdown-chip incident"
                   >
                     {aging.countdownLabel}
@@ -244,7 +283,7 @@ const OpenStreetMapView = ({
                     </>
                   )}
                 </Popup>
-              </CircleMarker>
+              </Marker>
             );
           })(),
         )}
@@ -258,48 +297,55 @@ const OpenStreetMapView = ({
             const dash = aging.ageRatio < 0.33 ? "3 9" : "5 5";
 
             return (
-              <CircleMarker
-                key={zone.id}
-                center={[zone.lat, zone.lng]}
-                radius={zone.radius || 50}
-                pathOptions={{
-                  color: zone.color || "#dc2626",
-                  fillColor: zone.color || "#dc2626",
-                  fillOpacity,
-                  weight: ringWeight,
-                  dashArray: dash,
-                }}
-              >
-                {aging.hasCountdown && (
-                  <Tooltip
-                    permanent
-                    direction="top"
-                    offset={[0, -18]}
-                    className="event-countdown-chip disaster"
-                  >
-                    {aging.countdownLabel}
-                  </Tooltip>
-                )}
-                <Popup>
-                  <strong style={{ color: zone.color }}>⚠️ {zone.title}</strong>
-                  <br />
-                  <em>{zone.detail}</em>
-                  <br />
-                  <br />
-                  <strong>Severity:</strong> {zone.severity}
-                  <br />
-                  <strong>Radius:</strong> {zone.radius}m
-                  <br />
-                  <strong>Status:</strong> All traffic rerouted
+              <div key={zone.id}>
+                <CircleMarker
+                  center={[zone.lat, zone.lng]}
+                  radius={zone.radius || 50}
+                  pathOptions={{
+                    color: zone.color || "#dc2626",
+                    fillColor: zone.color || "#dc2626",
+                    fillOpacity,
+                    weight: ringWeight,
+                    dashArray: dash,
+                  }}
+                >
                   {aging.hasCountdown && (
-                    <>
-                      <br />
-                      <strong>Expected clear:</strong>{" "}
-                      {aging.countdownLabel.replace("T-", "")}
-                    </>
+                    <Tooltip
+                      permanent
+                      direction="top"
+                      offset={[0, -18]}
+                      className="event-countdown-chip disaster"
+                    >
+                      {aging.countdownLabel}
+                    </Tooltip>
                   )}
-                </Popup>
-              </CircleMarker>
+                  <Popup>
+                    <strong style={{ color: zone.color }}>
+                      ⚠️ {zone.title}
+                    </strong>
+                    <br />
+                    <em>{zone.detail}</em>
+                    <br />
+                    <br />
+                    <strong>Severity:</strong> {zone.severity}
+                    <br />
+                    <strong>Radius:</strong> {zone.radius}m
+                    <br />
+                    <strong>Status:</strong> All traffic rerouted
+                    {aging.hasCountdown && (
+                      <>
+                        <br />
+                        <strong>Expected clear:</strong>{" "}
+                        {aging.countdownLabel.replace("T-", "")}
+                      </>
+                    )}
+                  </Popup>
+                </CircleMarker>
+                <Marker
+                  position={[zone.lat, zone.lng]}
+                  icon={iconCache.disasterIcon}
+                />
+              </div>
             );
           })(),
         )}

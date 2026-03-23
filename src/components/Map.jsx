@@ -4,6 +4,7 @@ import { useSimulation } from "../hooks/useSimulation";
 
 const Map = ({ useMockData = false }) => {
   const [mapClickRerouteMode, setMapClickRerouteMode] = useState(false);
+  const [mapClickDisasterMode, setMapClickDisasterMode] = useState(false);
   const {
     mapData,
     connected,
@@ -11,10 +12,36 @@ const Map = ({ useMockData = false }) => {
     selectedVehicle,
     rerouteVehicleToCoordinate,
     addAlert,
+    addDisasterAtLocation,
+    vehicleProfiles,
+    selectVehicle,
   } = useSimulation(useMockData, { controller: true });
   const vehicleCount = mapData?.markers?.length || 0;
 
+  const handleMarkerClick = (marker) => {
+    // Extract vehicle ID from marker label (e.g., "Unit U-102" -> "U-102")
+    const vehicleId = marker.label?.replace("Unit ", "");
+    if (vehicleId) {
+      selectVehicle(vehicleId);
+    }
+  };
+
   const handleMapClick = async ({ lat, lng }) => {
+    if (mapClickDisasterMode) {
+      if (!useMockData) {
+        addAlert("Map-click disaster creation is available in Demo Mode");
+        setMapClickDisasterMode(false);
+        return;
+      }
+
+      const created = addDisasterAtLocation(lat, lng, tick);
+      if (!created) {
+        addAlert("Could not create disaster zone at that location");
+      }
+      setMapClickDisasterMode(false);
+      return;
+    }
+
     if (!mapClickRerouteMode) {
       return;
     }
@@ -59,6 +86,21 @@ const Map = ({ useMockData = false }) => {
             ? "Click Destination..."
             : "Reroute By Map Click"}
         </button>
+        <button
+          type="button"
+          className={`map-action-btn ${mapClickDisasterMode ? "active" : ""}`}
+          onClick={() => {
+            setMapClickDisasterMode((value) => !value);
+            if (mapClickRerouteMode) {
+              setMapClickRerouteMode(false);
+            }
+          }}
+          title="Click map to create a disaster zone"
+        >
+          {mapClickDisasterMode
+            ? "Click to Create Disaster..."
+            : "Create Disaster"}
+        </button>
       </div>
       <OpenStreetMapView
         center={mapData.center}
@@ -70,8 +112,10 @@ const Map = ({ useMockData = false }) => {
         disasterZones={mapData.disasterZones}
         heatmapData={mapData.heatmapData}
         onMapClick={handleMapClick}
-        mapClickMode={mapClickRerouteMode}
+        onMarkerClick={handleMarkerClick}
+        mapClickMode={mapClickRerouteMode || mapClickDisasterMode}
         selectedVehicleLabel={selectedVehicle?.id}
+        vehicleProfiles={vehicleProfiles}
       />
       <div className="map-watermark">
         OpenStreetMap {connected ? "● Live" : "○ Offline"}
